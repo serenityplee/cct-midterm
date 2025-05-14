@@ -115,7 +115,8 @@ def analyze_competence(trace, informant_ids=None):
         DataFrame with competence estimates for each informant
     """
     # Extract competence samples
-    D_samples = az.extract(trace, var_names=['D']).D.values
+    # old code D_samples = az.extract(trace, var_names=['D']).D.values
+    D_samples = az.extract(trace, var_names=['D']).values
     
     # Calculate mean competence for each informant
     mean_competence = D_samples.mean(axis=0)
