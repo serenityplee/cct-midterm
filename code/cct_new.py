@@ -1,4 +1,4 @@
-#used chatgpt got help
+#I used chatgpt for help thoughout the assignment
 import numpy as np
 import pandas as pd
 import pymc as pm
