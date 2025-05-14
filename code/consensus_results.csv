@@ -1,0 +1,6 @@
+Question,Consensus_Probability,Consensus_Answer,Majority_Vote,Agreement
+Q1,0.973625,1,1,True
+Q2,0.251,0,0,True
+Q3,0.99625,1,1,True
+Q4,0.989625,1,1,True
+Q5,0.024125,0,0,True

@@ -1,0 +1,19 @@
+
+    CCT Model Analysis Report
+    
+    Model Structure:
+    - Competence (D): Beta(2,1) prior transformed to [0.5, 1]
+    - Consensus (Z): Bernoulli(0.5) prior
+    
+    Convergence:
+    - R-hat values all below 1.05: Yes
+    
+    Competence Estimates:
+    - Highest: 1.0 (0.871)
+    - Lowest: 6.0 (0.685)
+    - Average: 0.790
+    
+    Consensus Results:
+    - Total questions: 5
+    - Questions where CCT ≠ Majority: 0
+    

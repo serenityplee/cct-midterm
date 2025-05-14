@@ -7,8 +7,7 @@ import seaborn as sns
 
 def load_data(filepath):
     """
-    Load the plant knowledge dataset and return it as a numpy array,
-    excluding the Informant ID column.
+    Load the plant knowledge dataset and return it as a numpy array.
     
     Parameters:
     -----------
@@ -19,15 +18,19 @@ def load_data(filepath):
     --------
     np.ndarray
         2D array of binary responses where rows are informants and columns are questions
+    list
+        List of informant identifiers
     """
     # Load data from CSV
     data = pd.read_csv(filepath)
     
-    # Extract informant IDs for later reference
-    informant_ids = data['Informant_ID'].values
-    
-    # Remove the Informant_ID column and convert to numpy array
-    response_data = data.drop(columns=['Informant_ID']).values
+    # Extract informant IDs if they exist
+    if 'Informant_ID' in data.columns:
+        informant_ids = data['Informant_ID'].values.tolist()
+        response_data = data.drop(columns=['Informant_ID']).values
+    else:
+        informant_ids = [f"Informant_{i+1}" for i in range(len(data))]
+        response_data = data.values
     
     return response_data, informant_ids
 
@@ -49,26 +52,17 @@ def build_cct_model(X):
     
     with pm.Model() as cct_model:
         # Prior for informant competence (D)
-        # Using Beta distribution with parameters that favor competence above 0.5
-        # Beta(2,1) puts more weight on values above 0.5 while still allowing for the full range
         D_raw = pm.Beta('D_raw', alpha=2, beta=1, shape=N)
-        
-        # Transform to constrain D between 0.5 and 1
-        D = pm.Deterministic('D', 0.5 + 0.5 * D_raw)
+        D = pm.Deterministic('D', 0.5 + 0.5 * D_raw)  # Constrain between 0.5 and 1
         
         # Prior for consensus answers (Z)
-        # Bernoulli(0.5) reflects no prior knowledge about the correct answers
         Z = pm.Bernoulli('Z', p=0.5, shape=M)
         
-        # Reshape D for broadcasting
-        D_reshaped = D[:, None]  # Shape: (N, 1)
+        # Calculate response probabilities
+        p = Z * D[:, None] + (1 - Z) * (1 - D[:, None])
         
-        # Calculate response probability using the CCT formula
-        # p_ij = Z_j * D_i + (1 - Z_j) * (1 - D_i)
-        p = Z * D_reshaped + (1 - Z) * (1 - D_reshaped)
-        
-        # Define the likelihood
-        X_obs = pm.Bernoulli('X_obs', p=p, observed=X)
+        # Likelihood
+        pm.Bernoulli('X_obs', p=p, observed=X)
         
     return cct_model
 
@@ -93,8 +87,14 @@ def run_inference(model, draws=2000, chains=4, tune=1000):
         Trace object containing the samples
     """
     with model:
-        # Use the NUTS sampler for efficient exploration of the posterior
-        trace = pm.sample(draws=draws, chains=chains, tune=tune, random_seed=42)
+        trace = pm.sample(
+            draws=draws,
+            chains=chains,
+            tune=tune,
+            random_seed=42,
+            target_accept=0.9,
+            return_inferencedata=True
+        )
     
     return trace
 
@@ -106,37 +106,26 @@ def analyze_competence(trace, informant_ids=None):
     -----------
     trace : az.InferenceData
         MCMC samples from the model
-    informant_ids : np.ndarray, optional
-        Array of informant IDs
+    informant_ids : list, optional
+        List of informant IDs
         
     Returns:
     --------
     pd.DataFrame
         DataFrame with competence estimates for each informant
     """
-    # Extract competence samples
-    # old code D_samples = az.extract(trace, var_names=['D']).D.values
-    D_samples = az.extract(trace, var_names=['D']).values
+    # Get posterior samples for D
+    post = az.extract(trace)
+    mean_competence = post['D'].mean('sample').values
     
-    # Calculate mean competence for each informant
-    mean_competence = D_samples.mean(axis=0)
+    # Handle informant IDs
+    if informant_ids is None or len(informant_ids) != len(mean_competence):
+        informant_ids = [f"Informant_{i+1}" for i in range(len(mean_competence))]
     
-    # Create competence DataFrame
-    if informant_ids is not None:
-        competence_df = pd.DataFrame({
-            'Informant_ID': informant_ids,
-            'Competence': mean_competence
-        })
-    else:
-        competence_df = pd.DataFrame({
-            'Informant_ID': [f"Informant_{i+1}" for i in range(len(mean_competence))],
-            'Competence': mean_competence
-        })
-    
-    # Sort by competence (highest to lowest)
-    competence_df = competence_df.sort_values('Competence', ascending=False).reset_index(drop=True)
-    
-    return competence_df
+    return pd.DataFrame({
+        'Informant_ID': informant_ids,
+        'Competence': mean_competence
+    }).sort_values('Competence', ascending=False)
 
 def analyze_consensus(trace, X):
     """
@@ -154,189 +143,130 @@ def analyze_consensus(trace, X):
     pd.DataFrame
         DataFrame with consensus estimates and majority vote for each question
     """
-    # Extract consensus samples
-    Z_samples = az.extract(trace, var_names=['Z']).Z.values
+    # Get posterior samples for Z
+    post = az.extract(trace)
+    mean_consensus = post['Z'].mean('sample').values
     
-    # Calculate mean consensus probability for each question
-    mean_consensus_probs = Z_samples.mean(axis=0)
-    
-    # Determine most likely consensus answers (1 if p > 0.5, else 0)
-    consensus_answers = (mean_consensus_probs > 0.5).astype(int)
-    
-    # Calculate majority vote answers
+    # Calculate majority vote
     majority_vote = (X.mean(axis=0) > 0.5).astype(int)
     
-    # Create consensus DataFrame
-    consensus_df = pd.DataFrame({
-        'Question': [f"Q{i+1}" for i in range(len(mean_consensus_probs))],
-        'Consensus_Probability': mean_consensus_probs,
-        'Consensus_Answer': consensus_answers,
+    return pd.DataFrame({
+        'Question': [f"Q{i+1}" for i in range(len(mean_consensus))],
+        'Consensus_Probability': mean_consensus,
+        'Consensus_Answer': (mean_consensus > 0.5).astype(int),
         'Majority_Vote': majority_vote,
-        'Agreement': consensus_answers == majority_vote
+        'Agreement': (mean_consensus > 0.5) == (majority_vote == 1)
     })
-    
-    return consensus_df
 
 def visualize_results(trace, competence_df, consensus_df):
     """
     Visualize the results of the CCT analysis.
-    
-    Parameters:
-    -----------
-    trace : az.InferenceData
-        MCMC samples from the model
-    competence_df : pd.DataFrame
-        DataFrame with competence estimates
-    consensus_df : pd.DataFrame
-        DataFrame with consensus estimates
     """
     # Plot competence estimates
     plt.figure(figsize=(10, 6))
     sns.barplot(x='Informant_ID', y='Competence', data=competence_df)
     plt.title('Estimated Informant Competence')
-    plt.ylabel('Competence (probability of knowing correct answer)')
+    plt.ylabel('Competence')
     plt.xticks(rotation=45)
-    plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='Chance level')
-    plt.ylim(0.45, 1.0)
-    plt.legend()
+    plt.axhline(y=0.5, color='r', linestyle='--')
     plt.tight_layout()
     plt.savefig('competence_estimates.png')
+    plt.close()
     
-    # Plot consensus answers vs majority vote
+    # Plot consensus vs majority
     plt.figure(figsize=(12, 6))
-    
     x = np.arange(len(consensus_df))
     width = 0.35
     
-    plt.bar(x - width/2, consensus_df['Consensus_Probability'], width, label='CCT Model Probability')
+    plt.bar(x - width/2, consensus_df['Consensus_Probability'], width, label='CCT Probability')
     plt.bar(x + width/2, consensus_df['Majority_Vote'], width, label='Majority Vote', alpha=0.7)
     
-    plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.3)
     plt.xlabel('Question')
     plt.ylabel('Probability/Vote')
     plt.title('Consensus Answers vs Majority Vote')
     plt.xticks(x, consensus_df['Question'])
-    plt.ylim(0, 1.1)
     plt.legend()
     plt.tight_layout()
     plt.savefig('consensus_vs_majority.png')
+    plt.close()
     
-    # Plot trace and posterior distributions
-    az.plot_trace(trace, var_names=['D'])
-    plt.savefig('trace_D.png')
-    
-    az.plot_trace(trace, var_names=['Z'])
-    plt.savefig('trace_Z.png')
-    
-    # Assess convergence with pair plot
-    az.plot_pair(trace, var_names=['D'], kind='scatter')
-    plt.savefig('pair_plot_D.png')
+    # Plot posterior distributions
+    az.plot_posterior(trace, var_names=['D'])
+    plt.tight_layout()
+    plt.savefig('competence_posteriors.png')
+    plt.close()
 
 def generate_report(trace, competence_df, consensus_df):
     """
     Generate a report summarizing the CCT analysis results.
-    
-    Parameters:
-    -----------
-    trace : az.InferenceData
-        MCMC samples from the model
-    competence_df : pd.DataFrame
-        DataFrame with competence estimates
-    consensus_df : pd.DataFrame
-        DataFrame with consensus estimates
-        
-    Returns:
-    --------
-    str
-        Report text
     """
-    # Get summary statistics
-    summary = az.summary(trace)
+    # Convergence diagnostics
+    summary = az.summary(trace, var_names=['D', 'Z'])
+    converged = (summary['r_hat'] < 1.05).all()
     
-    # Check convergence
-    converged = (summary['r_hat'] < 1.1).all()
-    convergence_status = "Good convergence" if converged else "Poor convergence"
+    # Top and bottom informants
+    top = competence_df.iloc[0]
+    bottom = competence_df.iloc[-1]
     
-    # Get top and bottom informants
-    top_informant = competence_df.iloc[0]
-    bottom_informant = competence_df.iloc[-1]
-    
-    # Count disagreements between CCT and majority vote
+    # Disagreements
     disagreements = (~consensus_df['Agreement']).sum()
     
     report = f"""
-    # Cultural Consensus Theory Model Report
+    CCT Model Analysis Report
     
-    ## Model Structure and Priors
-    The CCT model was implemented using PyMC with the following structure:
-    - Informant competence (D) priors: Beta(2,1) transformed to range [0.5, 1.0]
-      - This prior slightly favors higher competence while allowing the full range of possible values
-    - Consensus answer (Z) priors: Bernoulli(0.5)
-      - This represents maximum uncertainty about the correct answers
+    Model Structure:
+    - Competence (D): Beta(2,1) prior transformed to [0.5, 1]
+    - Consensus (Z): Bernoulli(0.5) prior
     
-    ## Convergence Assessment
-    {convergence_status} was achieved with r_hat values {'all below 1.1' if converged else 'indicating some issues'}.
+    Convergence:
+    - R-hat values all below 1.05: {'Yes' if converged else 'No'}
     
-    ## Competence Estimates
-    - Most competent informant: {top_informant['Informant_ID']} with {top_informant['Competence']:.3f} estimated competence
-    - Least competent informant: {bottom_informant['Informant_ID']} with {bottom_informant['Competence']:.3f} estimated competence
-    - Average informant competence: {competence_df['Competence'].mean():.3f}
+    Competence Estimates:
+    - Highest: {top['Informant_ID']} ({top['Competence']:.3f})
+    - Lowest: {bottom['Informant_ID']} ({bottom['Competence']:.3f})
+    - Average: {competence_df['Competence'].mean():.3f}
     
-    ## Consensus Answers vs Majority Vote
-    - Number of questions: {len(consensus_df)}
-    - Questions where CCT model disagrees with majority vote: {disagreements}
-    
-    ## Discussion
-    Differences between the CCT model consensus and majority vote can be attributed to the CCT model's weighting of responses by informant competence. The model gives more weight to answers from informants with higher estimated competence, potentially leading to different consensus answers than simple majority voting when less competent informants form a majority. This demonstrates the key advantage of the CCT approach: it can identify the most likely correct answers even when they're not the most common responses, by accounting for differences in informant knowledge.
+    Consensus Results:
+    - Total questions: {len(consensus_df)}
+    - Questions where CCT ≠ Majority: {disagreements}
     """
+    
+    with open('cct_report.txt', 'w') as f:
+        f.write(report)
     
     return report
 
 def main():
-    """
-    Main function to run the CCT analysis.
-    """
-    # Set the filepath
-    filepath = "../data/plant_knowledge.csv"
-    
-    # Load the data
+    """Main analysis workflow"""
     try:
-        X, informant_ids = load_data(filepath)
-        print(f"Loaded data with shape: {X.shape}")
-    except FileNotFoundError:
-        print(f"File not found: {filepath}")
-        return
-    
-    # Build the CCT model
-    cct_model = build_cct_model(X)
-    
-    # Run inference
-    print("Running MCMC sampling...")
-    trace = run_inference(cct_model)
-    
-    # Analyze results
-    competence_df = analyze_competence(trace, informant_ids)
-    consensus_df = analyze_consensus(trace, X)
-    
-    # Visualize results
-    print("Generating visualizations...")
-    visualize_results(trace, competence_df, consensus_df)
-    
-    # Generate report
-    print("Generating report...")
-    report = generate_report(trace, competence_df, consensus_df)
-    
-    # Save dataframes to CSV
-    competence_df.to_csv('competence_results.csv', index=False)
-    consensus_df.to_csv('consensus_results.csv', index=False)
-    
-    # Save report to markdown file
-    with open('cct_report.md', 'w') as f:
-        f.write(report)
-    
-    print("Analysis complete! Results saved to files.")
-    
-    return trace, competence_df, consensus_df
+        # Load data
+        X, informant_ids = load_data("../data/plant_knowledge.csv")
+        print(f"Data loaded: {X.shape[0]} informants, {X.shape[1]} questions")
+        
+        # Build and run model
+        model = build_cct_model(X)
+        trace = run_inference(model)
+        
+        # Analyze results
+        competence_df = analyze_competence(trace, informant_ids)
+        consensus_df = analyze_consensus(trace, X)
+        
+        # Generate outputs
+        visualize_results(trace, competence_df, consensus_df)
+        report = generate_report(trace, competence_df, consensus_df)
+        
+        # Save results
+        competence_df.to_csv('competence_results.csv', index=False)
+        consensus_df.to_csv('consensus_results.csv', index=False)
+        
+        print("Analysis completed successfully")
+        print(report)
+        
+        return trace, competence_df, consensus_df
+        
+    except Exception as e:
+        print(f"Error in analysis: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
