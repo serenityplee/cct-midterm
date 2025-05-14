@@ -1,3 +1,4 @@
+#used chatgpt got help
 import numpy as np
 import pandas as pd
 import pymc as pm
